@@ -63,6 +63,8 @@ $script:loading = $false
 # 上一次真正落盘（写 layout.ini + 渲染）时的 dock 名集合。
 # 保存时用它和当前模型做差集，才知道哪些皮肤被删了、哪些是新增。
 $script:savedNames = @()
+# 删除条目 / Dock 时排队等待落盘的独占资源文件（保存成功后才真删）。
+$script:pendingDel = @()
 
 function Read-Layout {
     $m = Read-SdockLayout $layoutPath
@@ -191,7 +193,7 @@ $form.Controls.Add($numCols) | Out-Null
 $lblItems = New-Label '条目数：0' 12 526 258 18
 $form.Controls.Add($lblItems) | Out-Null
 
-$lblHint = New-Label ("提示：图标若选到 ico\ 目录之外会自动复制进皮肤；" + "链接优先记录 link\ 下的相对路径，选目录外的文件则记录绝对路径。`r`n改完点右下角「保存并渲染」。") 12 552 258 60
+$lblHint = New-Label ("提示：图标 / 链接只能引用资源文件夹（ico\ 与 link\）内的文件。`r`n" + "外部快捷方式请用「导入快捷方式」：自动提取图标入库 + 复制链接入库。`r`n删除条目会连它独占的资源文件一起真删（保存后生效）。") 12 552 258 74
 $form.Controls.Add($lblHint) | Out-Null
 
 # ---------- right: item grid ----------
@@ -225,15 +227,16 @@ foreach ($c in @(
 }
 $form.Controls.Add($grid) | Out-Null
 
-$btnItemAdd  = New-Button '添加条目' 290 542 92 28
-$btnItemDel  = New-Button '删除条目' 388 542 92 28
-$btnItemUp   = New-Button '上移'     486 542 56 28
-$btnItemDown = New-Button '下移'     548 542 56 28
-$btnItemTop  = New-Button '置顶'     610 542 56 28
-$btnItemBot  = New-Button '置底'     672 542 56 28
-$btnSetIcon  = New-Button '更换图标' 734 542 92 28
-$btnSetLink  = New-Button '更换链接' 832 542 92 28
-foreach ($b in @($btnItemAdd, $btnItemDel, $btnItemUp, $btnItemDown, $btnItemTop, $btnItemBot, $btnSetIcon, $btnSetLink)) {
+$btnItemAdd  = New-Button '添加条目'     290 542 92 28
+$btnItemDel  = New-Button '删除条目'     388 542 92 28
+$btnImport   = New-Button '导入快捷方式' 486 542 100 28
+$btnItemUp   = New-Button '上移'         590 542 52 28
+$btnItemDown = New-Button '下移'         646 542 52 28
+$btnItemTop  = New-Button '置顶'         702 542 52 28
+$btnItemBot  = New-Button '置底'         758 542 52 28
+$btnSetIcon  = New-Button '更换图标'     814 542 84 28
+$btnSetLink  = New-Button '更换链接'     902 542 84 28
+foreach ($b in @($btnItemAdd, $btnItemDel, $btnImport, $btnItemUp, $btnItemDown, $btnItemTop, $btnItemBot, $btnSetIcon, $btnSetLink)) {
     $b.Anchor = 'Bottom,Left,Right'
     $form.Controls.Add($b) | Out-Null
 }
@@ -345,36 +348,208 @@ function Rebuild-Docks([object[]]$arr) {
 
 # ------------------------------------------------------------
 # icon / link pickers
+# 图标与链接只允许引用资源文件夹内的文件，外部的走「导入快捷方式」
 # ------------------------------------------------------------
 $iconRootAbs = Expand-Root $globalCfg['IconRoot']
 $linkRootAbs = Expand-Root $globalCfg['LinkRoot']
 
-function Resolve-Icon([string]$picked) {
-    $full = [System.IO.Path]::GetFullPath($picked)
-    $root = $iconRootAbs.TrimEnd('\') + '\'
-    if ($full.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)) {
-        return $full.Substring($root.Length)
-    }
-    if (-not (Test-Path $iconRootAbs)) { New-Item -ItemType Directory -Path $iconRootAbs -Force | Out-Null }
-    $base = [System.IO.Path]::GetFileNameWithoutExtension($full)
-    $ext = [System.IO.Path]::GetExtension($full)
-    $dest = Join-Path $iconRootAbs ($base + $ext)
+function Within-Root([string]$full, [string]$root) {
+    $r = $root.TrimEnd('\') + '\'
+    return $full.StartsWith($r, [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Relative-To([string]$full, [string]$root) {
+    return $full.Substring($root.TrimEnd('\').Length + 1)
+}
+
+function To-Abs([string]$root, [string]$v) {
+    if ([System.IO.Path]::IsPathRooted($v)) { return [System.IO.Path]::GetFullPath($v) }
+    return [System.IO.Path]::GetFullPath((Join-Path $root $v))
+}
+
+# 目录内不重名的目标路径
+function Unique-Path([string]$dir, [string]$base, [string]$ext) {
+    $dest = Join-Path $dir ($base + $ext)
     $n = 1
-    while ((Test-Path $dest) -and ((Get-FileHash $dest -Algorithm SHA1).Hash -ne (Get-FileHash $full -Algorithm SHA1).Hash)) {
-        $dest = Join-Path $iconRootAbs ('{0}_{1}{2}' -f $base, $n, $ext)
+    while (Test-Path $dest) {
+        $dest = Join-Path $dir ('{0}_{1}{2}' -f $base, $n, $ext)
         $n++
     }
-    if (-not (Test-Path $dest)) { Copy-Item $full $dest }
-    return [System.IO.Path]::GetFileName($dest)
+    return $dest
+}
+
+function Safe-Name([string]$s) {
+    foreach ($ch in [System.IO.Path]::GetInvalidFileNameChars()) { $s = $s.Replace([string]$ch, '_') }
+    return $s.Trim()
+}
+
+# SHDefExtractIcon / ExtractIconEx 能拿到程序里最大号的图标（ExtractAssociatedIcon 只有 32px）。
+# 两段都编译不进（没有 C# 编译器）就退回 ExtractAssociatedIcon。
+if (-not ('SdockWin32' -as [type])) {
+    try {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class SdockWin32 {
+    [DllImport("shell32.dll", CharSet=CharSet.Unicode)]
+    public static extern uint ExtractIconEx(string file, int index, IntPtr[] large, IntPtr[] small, uint count);
+    [DllImport("shell32.dll", CharSet=CharSet.Unicode)]
+    public static extern int SHDefExtractIcon(string file, int index, uint flags, out IntPtr large, out IntPtr small, uint size);
+    [DllImport("user32.dll")]
+    public static extern bool DestroyIcon(IntPtr h);
+}
+'@
+    } catch { }
+}
+
+# 取 file 的第 $index 个图标存成 PNG；失败返回 $false（不会留下半个文件）
+function Save-IconPng([string]$file, [int]$index, [string]$dest) {
+    $h = [IntPtr]::Zero
+    $owned = $false
+    if ('SdockWin32' -as [type]) {
+        # 先要 256px 的（现代程序一般给得出），拿不到再退回 ExtractIconEx 的最大号图标。
+        try {
+            $big = [IntPtr]::Zero
+            $sml = [IntPtr]::Zero
+            if (([SdockWin32]::SHDefExtractIcon($file, $index, 0, [ref]$big, [ref]$sml, 256) -eq 0) -and $big -ne [IntPtr]::Zero) {
+                $h = $big; $owned = $true
+                if ($sml -ne [IntPtr]::Zero) { [void][SdockWin32]::DestroyIcon($sml) }
+            }
+        } catch { }
+        if ($h -eq [IntPtr]::Zero) {
+            try {
+                $lg = [IntPtr[]]::New(1)
+                $sm = [IntPtr[]]::New(1)
+                $n = [SdockWin32]::ExtractIconEx($file, $index, $lg, $sm, 1)
+                if ($n -gt 0 -and $lg[0] -ne [IntPtr]::Zero) { $h = $lg[0]; $owned = $true }
+                elseif ($n -gt 0 -and $sm[0] -ne [IntPtr]::Zero) { $h = $sm[0]; $owned = $true }
+            } catch { }
+        }
+    }
+    $bmp = $null
+    $tmp = $dest + '.tmp'
+    try {
+        if ($h -ne [IntPtr]::Zero) {
+            $ico = [System.Drawing.Icon]::FromHandle($h)
+            $bmp = $ico.ToBitmap()
+        } else {
+            $ico = [System.Drawing.Icon]::ExtractAssociatedIcon($file)
+            if ($null -eq $ico) { return $false }
+            $bmp = $ico.ToBitmap()
+        }
+        $bmp.Save($tmp, [System.Drawing.Imaging.ImageFormat]::Png)
+        Move-Item $tmp $dest -Force
+        return $true
+    } catch {
+        if (Test-Path $tmp) { Remove-Item $tmp -Force }
+        return $false
+    } finally {
+        if ($bmp) { $bmp.Dispose() }
+        if ($owned -and ('SdockWin32' -as [type])) { [void][SdockWin32]::DestroyIcon($h) }
+    }
+}
+
+# .lnk 的目标程序与自定义图标位置；读不出来返回 $null
+function Shortcut-Info([string]$lnk) {
+    try {
+        $sh = New-Object -ComObject WScript.Shell
+        $sl = $sh.CreateShortcut($lnk)
+        $r = @{ Target = [string]$sl.TargetPath; IconFile = ''; IconIndex = 0 }
+        $il = [string]$sl.IconLocation
+        if ($il) {
+            $parts = $il -split ','
+            $r.IconFile = $parts[0].Trim().Trim('"')
+            if ($parts.Count -gt 1) {
+                $ix = 0
+                if ([int]::TryParse($parts[1].Trim(), [ref]$ix)) { $r.IconIndex = $ix }
+            }
+        }
+        [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($sh)
+        return $r
+    } catch { return $null }
+}
+
+# 外部快捷方式入库：link\<分类>\x.lnk + ico\x.png，返回相对路径
+function Import-Shortcut([string]$src, [string]$category) {
+    $full = [System.IO.Path]::GetFullPath($src)
+    if (-not (Test-Path $full)) { return @{ Error = '文件不存在' } }
+    $ext = [System.IO.Path]::GetExtension($full).ToLower()
+    if (($ext -ne '.lnk') -and ($ext -ne '.url')) { return @{ Error = '不是快捷方式（只支持 .lnk / .url）' } }
+    $base = Safe-Name ([System.IO.Path]::GetFileNameWithoutExtension($full))
+    if ($base -eq '') { return @{ Error = '快捷方式名无效' } }
+
+    $linkRel = ''
+    if (Within-Root $full $linkRootAbs) {
+        $linkRel = Relative-To $full $linkRootAbs
+    } else {
+        $dir = Join-Path $linkRootAbs (Safe-Name $category)
+        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        $dest = Unique-Path $dir $base $ext
+        try { Copy-Item -LiteralPath $full -Destination $dest -Force }
+        catch { return @{ Error = ('快捷方式复制失败：' + $_.Exception.Message) } }
+        $linkRel = Relative-To $dest $linkRootAbs
+    }
+
+    if (-not (Test-Path $iconRootAbs)) { New-Item -ItemType Directory -Path $iconRootAbs -Force | Out-Null }
+    $icoRel = ''; $warn = ''
+    # 图标来源优先级：快捷方式自定义图标位置 -> 目标程序 -> 快捷方式本身
+    $candFile = New-Object System.Collections.Generic.List[string]
+    $candIndex = New-Object System.Collections.Generic.List[int]
+    if ($ext -eq '.lnk') {
+        $info = Shortcut-Info $full
+        if ($info) {
+            $ifile = $info.IconFile
+            if ($ifile) {
+                $ifile = [Environment]::ExpandEnvironmentVariables($ifile)
+                if (-not [System.IO.Path]::IsPathRooted($ifile)) {
+                    $ifile = Join-Path ([System.IO.Path]::GetDirectoryName($full)) $ifile
+                }
+                if (Test-Path $ifile) {
+                    $candFile.Add($ifile) | Out-Null
+                    $candIndex.Add([int]$info.IconIndex) | Out-Null
+                }
+            }
+            if ($info.Target -and (Test-Path $info.Target)) {
+                $candFile.Add($info.Target) | Out-Null
+                $candIndex.Add(0) | Out-Null
+            }
+        }
+    }
+    $candFile.Add($full) | Out-Null
+    $candIndex.Add(0) | Out-Null
+    $icoDest = Unique-Path $iconRootAbs $base '.png'
+    for ($t = 0; $t -lt $candFile.Count; $t++) {
+        if (Save-IconPng $candFile[$t] $candIndex[$t] $icoDest) { $icoRel = [System.IO.Path]::GetFileName($icoDest); break }
+    }
+    if ($icoRel -eq '') { $warn = '没能从快捷方式提取到图标，请用「更换图标」从 ico\ 里补一个' }
+
+    return @{ Name = $base; Link = $linkRel; Icon = $icoRel; Warn = $warn }
+}
+
+# 条目引用、且位于资源文件夹内的文件 -> 绝对路径列表
+function Resource-Files($it) {
+    $out = @()
+    if ($it.Icon) {
+        $a = To-Abs $iconRootAbs $it.Icon
+        if ((Within-Root $a $iconRootAbs) -and (Test-Path $a)) { $out += $a }
+    }
+    if ($it.Link) {
+        $a = To-Abs $linkRootAbs $it.Link
+        if ((Within-Root $a $linkRootAbs) -and (Test-Path $a)) { $out += $a }
+    }
+    return $out
+}
+
+function Resolve-Icon([string]$picked) {
+    $full = [System.IO.Path]::GetFullPath($picked)
+    if (Within-Root $full $iconRootAbs) { return Relative-To $full $iconRootAbs }
+    return $null
 }
 
 function Resolve-Link([string]$picked) {
     $full = [System.IO.Path]::GetFullPath($picked)
-    $root = $linkRootAbs.TrimEnd('\') + '\'
-    if ($full.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)) {
-        return $full.Substring($root.Length)
-    }
-    return $full
+    if (Within-Root $full $linkRootAbs) { return Relative-To $full $linkRootAbs }
+    return $null
 }
 
 function Set-Cell([int]$row, [int]$col, [string]$value) {
@@ -439,10 +614,19 @@ $btnDockAdd.Add_Click({
 $btnDockDel.Add_Click({
     $d = Current-Dock
     if ($null -eq $d) { return }
+    $files = @()
+    foreach ($it in $d.Items) { $files += Resource-Files $it }
+    $fileMsg = '该 Dock 的条目没有引用 ico\ / link\ 内的文件。'
+    if ($files.Count -gt 0) {
+        $shown = $files
+        if ($files.Count -gt 6) { $shown = ($files[0..5] + ('...共 {0} 个文件' -f $files.Count)) }
+        $fileMsg = "保存后会一并删除它独占的 $($files.Count) 个资源文件：`r`n" + (($shown | ForEach-Object { [System.IO.Path]::GetFileName($_) }) -join "`r`n")
+    }
     $res = [System.Windows.Forms.MessageBox]::Show(
-        "确定删除 Dock「$($d.Name)」及其 $($d.Items.Count) 个条目吗？`r`n保存后会卸载该皮肤，并删除皮肤文件 $($d.Name)\$($d.Name).ini（文件夹空了也一并删掉）。`r`n@Resources 里的图标和快捷方式副本不会动，layout.ini 会先备份。",
+        "确定删除 Dock「$($d.Name)」及其 $($d.Items.Count) 个条目吗？`r`n保存后会卸载该皮肤，并删除皮肤文件 $($d.Name)\$($d.Name).ini（文件夹空了也一并删掉）。`r`n" + $fileMsg + "`r`nlayout.ini 会先备份。",
         'sdock', 'YesNo', 'Warning')
     if ($res -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+    foreach ($f in $files) { $script:pendingDel += $f }
     $arr = @($script:docks.Values | Where-Object { $_.Name -ne $d.Name })
     Rebuild-Docks $arr
     if ($script:current -ge $arr.Count) { $script:current = $arr.Count - 1 }
@@ -451,6 +635,7 @@ $btnDockDel.Add_Click({
         $grid.Rows.Clear()
         $lblItems.Text = '条目数：0'
     }
+    Set-Status "已删除 Dock，排队待删 $($files.Count) 个资源文件，点「保存并渲染」后生效。" 'black'
 })
 
 $btnDockUp.Add_Click({
@@ -501,10 +686,60 @@ $btnItemDel.Add_Click({
     if ($i -lt 0) { return }
     Save-Grid
     $d = Current-Dock
+    $it = $d.Items[$i]
+    $files = Resource-Files $it
+    $msg = "确定删除条目「$($it.Name)」吗？"
+    if ($files.Count -gt 0) {
+        $msg += "`r`n`r`n保存后会一并删除资源文件：`r`n" + ($files -join "`r`n") + "`r`n（被其它条目共用的会自动保留）"
+    } else {
+        $msg += "`r`n`r`n这个条目没有引用 ico\ / link\ 内的文件，只从 layout.ini 移除。"
+    }
+    $res = [System.Windows.Forms.MessageBox]::Show($msg, 'sdock', 'YesNo', 'Question')
+    if ($res -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+    foreach ($f in $files) { $script:pendingDel += $f }
     $d.Items.RemoveAt($i)
     Load-Dock $script:current
     Update-DockList
     if ($i -lt $grid.Rows.Count) { $grid.CurrentCell = $grid.Rows[$i].Cells[1] }
+    if ($files.Count -gt 0) { Set-Status "已删除条目，待删 $($files.Count) 个资源文件，点「保存并渲染」后生效。" 'black' }
+})
+
+$btnImport.Add_Click({
+    $d = Current-Dock
+    if ($null -eq $d) { return }
+    Save-Grid
+    $dlg = New-Object System.Windows.Forms.OpenFileDialog
+    $dlg.Title = '导入外部快捷方式（可多选）'
+    $dlg.Filter = '快捷方式 (*.lnk;*.url)|*.lnk;*.url|所有文件 (*.*)|*.*'
+    $dlg.Multiselect = $true
+    $desk = [Environment]::GetFolderPath('Desktop')
+    if ($desk -and (Test-Path $desk)) { $dlg.InitialDirectory = $desk }
+    if ($dlg.ShowDialog($form) -ne [System.Windows.Forms.DialogResult]::OK) { return }
+    $cat = if ($d.Title) { $d.Title } else { $d.Name }
+    $ok = 0; $msgs = @()
+    foreach ($f in $dlg.FileNames) {
+        $full = [System.IO.Path]::GetFullPath($f)
+        if ((Within-Root $full $linkRootAbs) -or (Within-Root $full $iconRootAbs)) {
+            $msgs += ('已在资源库内，请改用「更换图标 / 更换链接」：' + [System.IO.Path]::GetFileName($full))
+            continue
+        }
+        $r = Import-Shortcut $full $cat
+        if ($r.Error) { $msgs += ('失败 ' + [System.IO.Path]::GetFileName($full) + '：' + $r.Error); continue }
+        $d.Items.Add([pscustomobject]@{ Name = $r.Name; Icon = $r.Icon; Link = $r.Link }) | Out-Null
+        $ok++
+        if ($r.Warn) { $msgs += ($r.Name + '：' + $r.Warn) }
+    }
+    Load-Dock $script:current
+    Update-DockList
+    $last = $grid.Rows.Count - 1
+    if ($ok -gt 0 -and $last -ge 0) {
+        $grid.ClearSelection()
+        $grid.Rows[$last].Selected = $true
+        $grid.CurrentCell = $grid.Rows[$last].Cells[1]
+    }
+    $log = "已导入 $ok 个到 [$($d.Name)]，图标 / 链接已入库，点「保存并渲染」上屏。"
+    if ($msgs.Count -gt 0) { $log += "`r`n" + (($msgs | Select-Object -First 8) -join "`r`n") }
+    Set-Status $log $(if ($ok -gt 0) { 'green' } else { 'red' })
 })
 
 $btnItemUp.Add_Click({
@@ -541,9 +776,16 @@ $btnSetIcon.Add_Click({
     $i = Selected-Row
     if ($i -lt 0) { return }
     Save-Grid
-    $f = Pick-File '选择图标' '图片文件 (*.png;*.ico;*.jpg;*.jpeg;*.bmp;*.gif)|*.png;*.ico;*.jpg;*.jpeg;*.bmp;*.gif|所有文件 (*.*)|*.*' $iconRootAbs
+    $f = Pick-File '选择图标（只能用 ico\ 内的文件）' '图片文件 (*.png;*.ico;*.jpg;*.jpeg;*.bmp;*.gif)|*.png;*.ico;*.jpg;*.jpeg;*.bmp;*.gif|所有文件 (*.*)|*.*' $iconRootAbs
     if ($null -eq $f) { return }
     $rel = Resolve-Icon $f
+    if ($null -eq $rel) {
+        [void][System.Windows.Forms.MessageBox]::Show(
+            '图标只能引用资源文件夹 ico\ 内的文件。' + "`r`n" + '选中的文件在它之外：' + $f + "`r`n`r`n" + '如果这是某个程序的快捷方式，请用「导入快捷方式」，它会自动把图标提取到 ico\ 入库。',
+            'sdock 配置编辑器', 'OK', 'Warning')
+        Set-Status '图标未修改：所选文件在 ico\ 之外' 'red'
+        return
+    }
     Set-Cell $i 2 $rel
     Save-Grid
     Set-Status "图标 -> $rel" 'black'
@@ -553,9 +795,16 @@ $btnSetLink.Add_Click({
     $i = Selected-Row
     if ($i -lt 0) { return }
     Save-Grid
-    $f = Pick-File '选择快捷方式 / 程序 / 文件夹目标' '快捷方式 (*.lnk;*.url)|*.lnk;*.url|所有文件 (*.*)|*.*' $linkRootAbs
+    $f = Pick-File '选择快捷方式（只能用 link\ 内的文件）' '快捷方式 (*.lnk;*.url)|*.lnk;*.url|所有文件 (*.*)|*.*' $linkRootAbs
     if ($null -eq $f) { return }
     $rel = Resolve-Link $f
+    if ($null -eq $rel) {
+        [void][System.Windows.Forms.MessageBox]::Show(
+            '链接只能引用资源文件夹 link\ 内的快捷方式。' + "`r`n" + '选中的文件在它之外：' + $f + "`r`n`r`n" + '请用「导入快捷方式」，它会把快捷方式复制到 link\分类\ 入库（.lnk 还会顺便提取图标）。',
+            'sdock 配置编辑器', 'OK', 'Warning')
+        Set-Status '链接未修改：所选文件在 link\ 之外' 'red'
+        return
+    }
     Set-Cell $i 3 $rel
     Save-Grid
     Set-Status "链接 -> $rel" 'black'
@@ -574,6 +823,16 @@ $btnSave.Add_Click({
             if ($it.Name -eq '') { $errs += "[$($d.Name)] 第 $i 项标签为空。" }
             if ($it.Icon -eq '') { $errs += "[$($d.Name)] 第 $i 项没有图标。" }
             if ($it.Link -eq '') { $errs += "[$($d.Name)] 第 $i 项没有链接。" }
+            if ($it.Icon -ne '') {
+                $ia = To-Abs $iconRootAbs $it.Icon
+                if (-not (Within-Root $ia $iconRootAbs)) { $errs += "[$($d.Name)] 第 $i 项图标在 ico\ 之外，请用「导入快捷方式」。" }
+                elseif (-not (Test-Path $ia)) { $errs += "[$($d.Name)] 第 $i 项图标文件不存在：ico\$($it.Icon)。" }
+            }
+            if ($it.Link -ne '') {
+                $la = To-Abs $linkRootAbs $it.Link
+                if (-not (Within-Root $la $linkRootAbs)) { $errs += "[$($d.Name)] 第 $i 项链接在 link\ 之外，请用「导入快捷方式」。" }
+                elseif (-not (Test-Path $la)) { $errs += "[$($d.Name)] 第 $i 项快捷方式不存在：link\$($it.Link)。" }
+            }
         }
     }
     if ($errs.Count -gt 0) {
@@ -635,6 +894,35 @@ $btnSave.Add_Click({
             $log += '已刷新皮肤'
         } else {
             $log += '已渲染，但没找到 Rainmeter.exe，请手动刷新皮肤。'
+        }
+
+        # 真正的删除：条目 / Dock 移除后，把只属于它们的资源文件从磁盘清掉。
+        # 仍被其它条目引用的自动保留（PowerShell 哈希表大小写不敏感，路径共用也能识别）。
+        if ($script:pendingDel.Count -gt 0) {
+            $referenced = @{}
+            foreach ($dd in $script:docks.Values) {
+                foreach ($it in $dd.Items) {
+                    if ($it.Icon) { $referenced[(To-Abs $iconRootAbs $it.Icon)] = $true }
+                    if ($it.Link) { $referenced[(To-Abs $linkRootAbs $it.Link)] = $true }
+                }
+            }
+            $delOk = 0; $delKeep = 0; $delFail = @()
+            foreach ($fp in ($script:pendingDel | Select-Object -Unique)) {
+                if ($referenced.ContainsKey($fp)) { $delKeep++; continue }
+                if (-not (Test-Path -LiteralPath $fp)) { continue }
+                try { Remove-Item -LiteralPath $fp -Force; $delOk++ } catch { $delFail += $fp }
+            }
+            $log += "删除资源文件 $delOk 个"
+            if ($delKeep -gt 0) { $log += "（$delKeep 个被别的条目共用，保留）" }
+            if ($delFail.Count -gt 0) { $log += ('；被占用删不掉，请手动删除：' + ($delFail -join '；')) }
+            if (Test-Path -LiteralPath $linkRootAbs) {
+                foreach ($sub in @(Get-ChildItem -LiteralPath $linkRootAbs -Directory -Force)) {
+                    if (@(Get-ChildItem -LiteralPath $sub.FullName -Recurse -File -Force).Count -eq 0) {
+                        try { Remove-Item -LiteralPath $sub.FullName -Recurse -Force; $log += "清空分类文件夹 $($sub.Name) " } catch { }
+                    }
+                }
+            }
+            $script:pendingDel = @()
         }
 
         $tailLines = @($res | ForEach-Object {
