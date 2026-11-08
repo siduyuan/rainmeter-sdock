@@ -1,6 +1,6 @@
 # sdock
 
-一个 Rainmeter 桌面 dock 皮肤：把常用软件按分类收进多条悬浮 dock，鼠标靠近逐级放大，配置全部由图形化编辑器完成，不手写 ini。
+一个 [Rainmeter](https://www.rainmeter.net/)（雨滴桌面）的 dock 皮肤：把常用软件按分类收进多条悬浮 dock，鼠标靠近逐级放大，配置全部由图形化编辑器完成，不手写 ini。
 
 ## 特性
 
@@ -39,7 +39,7 @@ sdock/
 
 4. 在编辑器里改完点「保存并渲染」，皮肤会自动重写并刷新。
 
-依赖：Windows + Rainmeter + 系统自带的 PowerShell 5.1（编辑器需要 .NET WinForms，无需额外安装）。
+依赖：Windows + [Rainmeter](https://www.rainmeter.net/) + 系统自带的 PowerShell 5.1（编辑器需要 .NET WinForms，无需额外安装）。
 
 ## 关于图标与链接
 
