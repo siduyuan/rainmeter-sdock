@@ -2,7 +2,7 @@
 # config.ps1 - sdock layout editor (WinForms GUI)
 #
 # The only file it edits: @Resources\layout.ini
-# Save pipeline: backup layout.ini -> rewrite it -> run render.ps1
+# Save pipeline: backup layout.ini -> rewrite it -> Render-Skins (in-process)
 #                -> send bangs to Rainmeter.exe
 #
 # Run:  powershell -NoProfile -ExecutionPolicy Bypass -File config.ps1
@@ -28,12 +28,13 @@ Add-Type -AssemblyName System.Drawing
 $resourcesDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $skinBasePath = Split-Path -Parent $resourcesDir
 $layoutPath   = Join-Path $resourcesDir 'layout.ini'
-$renderPath   = Join-Path $resourcesDir 'render.ps1'
-$psExe        = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-$utf8bom      = New-Object System.Text.UTF8Encoding($true)
+$varsPath     = Join-Path $resourcesDir 'Variables.inc'
 
 if (-not (Test-Path $layoutPath)) { throw "找不到 layout.ini: $layoutPath" }
-if (-not (Test-Path $renderPath)) { throw "找不到 render.ps1: $renderPath" }
+if (-not (Test-Path $varsPath))   { throw "找不到 Variables.inc: $varsPath" }
+
+# layout 解析/写回与皮肤渲染都在 render.ps1（只定义函数），本文件只管界面。
+. (Join-Path $resourcesDir 'render.ps1')
 
 # ------------------------------------------------------------
 # roots (IconRoot / LinkRoot come from layout.ini [sdock])
@@ -64,72 +65,13 @@ $script:loading = $false
 $script:savedNames = @()
 
 function Read-Layout {
-    $nd = [ordered]@{}
-    $cur = $null
-    foreach ($line in [System.IO.File]::ReadAllLines($layoutPath)) {
-        if ($line -match '^\s*(;|$)') { continue }
-        if ($line -match '^\s*\[([^\]]+)\]\s*$') {
-            $name = $Matches[1]
-            if ($name -eq 'sdock') { $cur = 'sdock'; continue }
-            $cur = $name
-            $nd[$name] = [pscustomobject]@{
-                Name    = $name
-                Title   = $name
-                Columns = 3
-                Items   = (New-Object System.Collections.Generic.List[object])
-            }
-            continue
-        }
-        if ($null -eq $cur) { continue }
-        if ($line -notmatch '^\s*([A-Za-z0-9_]+)\s*=\s*(.*)$') { continue }
-        $k = $Matches[1]
-        $v = $Matches[2].Trim()
-        if ($cur -eq 'sdock') { $globalCfg[$k] = $v; continue }
-        $d = $nd[$cur]
-        if ($k -eq 'Title') {
-            $d.Title = $v
-        } elseif ($k -eq 'Columns') {
-            $intv = 0
-            if ([int]::TryParse($v, [ref]$intv)) { $d.Columns = $intv }
-        } elseif ($k -match '^Item(\d+)$') {
-            $idx = [int]$Matches[1]
-            $p = $v -split '\|', 3
-            $lbl = ''; $ico = ''; $tgt = ''
-            if ($p.Count -ge 1) { $lbl = $p[0] }
-            if ($p.Count -ge 2) { $ico = $p[1] }
-            if ($p.Count -ge 3) { $tgt = $p[2] }
-            $d.Items.Add([pscustomobject]@{ Order = $idx; Name = $lbl; Icon = $ico; Link = $tgt }) | Out-Null
-        }
-    }
-    foreach ($d in $nd.Values) {
-        $sorted = @($d.Items | Sort-Object Order)
-        $d.Items.Clear()
-        foreach ($it in $sorted) { $d.Items.Add($it) | Out-Null }
-    }
-    $script:docks = $nd
-    $script:savedNames = @($nd.Keys)
+    $m = Read-SdockLayout $layoutPath
+    $script:docks = $m.Docks
+    foreach ($k in $m.Global.Keys) { $globalCfg[$k] = $m.Global[$k] }
+    $script:savedNames = @($m.Docks.Keys)
 }
 
-function Write-Layout {
-    $lines = New-Object System.Collections.Generic.List[string]
-    $lines.Add('; sdock layout - the ONLY content source; parsed by render.ps1 and the config GUI, never by Rainmeter')
-    $lines.Add("; item line: ItemN=Label|IconFile|LinkTarget   ('|' cannot occur in Windows file names)")
-    $lines.Add('[sdock]')
-    $lines.Add('IconRoot=' + $globalCfg['IconRoot'])
-    $lines.Add('LinkRoot=' + $globalCfg['LinkRoot'])
-    foreach ($d in $script:docks.Values) {
-        $lines.Add('')
-        $lines.Add('[' + $d.Name + ']')
-        $lines.Add('Title=' + $d.Title)
-        $lines.Add('Columns=' + $d.Columns)
-        $i = 0
-        foreach ($it in $d.Items) {
-            $i++
-            $lines.Add('Item' + $i + '=' + $it.Name + '|' + $it.Icon + '|' + $it.Link)
-        }
-    }
-    [System.IO.File]::WriteAllText($layoutPath, (($lines -join "`r`n") + "`r`n"), $utf8bom)
-}
+function Write-Layout { Write-SdockLayout $layoutPath $script:docks $globalCfg }
 
 # ------------------------------------------------------------
 # helpers
@@ -649,8 +591,9 @@ $btnSave.Add_Click({
         if (Test-Path $layoutPath) { Copy-Item $layoutPath ($layoutPath + '.bak') -Force }
         Write-Layout
 
-        $renderOut = & $psExe -NoProfile -ExecutionPolicy Bypass -File $renderPath 2>&1 | Out-String
-        if ($LASTEXITCODE -ne 0) { throw ("render.ps1 失败 (exit $LASTEXITCODE)：`r`n" + $renderOut) }
+        # 直接用内存模型渲染，不再起子进程、不再重读刚写下的 layout.ini。
+        # Variables.inc 每次重读，改样式常量后无需重启编辑器。
+        $res = Render-Skins -Docks $script:docks -Vars (Read-SdockVars $varsPath) -Cfg $globalCfg -BasePath $skinBasePath
         $script:savedNames = @($script:docks.Keys)
 
         $log = ''
@@ -694,7 +637,10 @@ $btnSave.Add_Click({
             $log += '已渲染，但没找到 Rainmeter.exe，请手动刷新皮肤。'
         }
 
-        $tailLines = @($renderOut -split "`r?`n" | Where-Object { $_ -match '\[OK\]|\[SKIP\]' })
+        $tailLines = @($res | ForEach-Object {
+            if ($_.Skipped) { return "[SKIP] $($_.Dock)（无条目）" }
+            '[OK] {0}.ini {1} 项 {2} 列 背景 {3}x{4} / {5}x{6}' -f $_.Dock, $_.Items, $_.Columns, $_.BgW, $_.BgH, $_.BgW48, $_.BgH48
+        })
         $summary = ('保存成功：{0} 个 Dock，{1} 个条目。' -f $script:docks.Count,
                     (@($script:docks.Values | ForEach-Object { $_.Items.Count } | Measure-Object -Sum).Sum))
         Set-Status ($summary + "`r`n" + ($tailLines -join '  ') + "`r`n" + $log) 'green'
